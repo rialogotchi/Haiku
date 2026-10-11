@@ -1,0 +1,186 @@
+name: Build Haiku image
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Mimari"
+        type: choice
+        default: x86_64
+        options:
+          - x86_64
+          - x86_gcc2h
+      target:
+        description: "Jam hedefi (raw = .img, anyboot = USB'ye yazılabilir hibrit .iso)"
+        type: choice
+        default: nightly-raw
+        options:
+          - nightly-raw
+          - minimum-raw
+          - nightly-anyboot
+          - minimum-anyboot
+          - nightly-vmware
+      image_size_mb:
+        description: "İmaj boyutu (MB). Boş bırakırsan Haiku varsayılanı kullanılır"
+        type: string
+        default: ""
+      apply_theme:
+        description: "Future temasını imaja ekle (theme/ klasörü gerekir)"
+        type: boolean
+        default: true
+      theme_variant:
+        description: "Tema varyanti"
+        type: choice
+        default: Future
+        options:
+          - Future
+          - FutureDark
+      xz_compress:
+        description: "Çıktıyı .xz ile sıkıştır"
+        type: boolean
+        default: false
+      create_release:
+        description: "GitHub Release oluştur ve imajı ekle (.xz sıkıştırması otomatik etkinleşir)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-haiku-${{ github.ref }}-${{ inputs.arch }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      ARCH: ${{ inputs.arch }}
+      TARGET: ${{ inputs.target }}
+      IMAGE_SIZE_MB: ${{ inputs.image_size_mb }}
+      APPLY_THEME: ${{ inputs.apply_theme }}
+      THEME_VARIANT: ${{ inputs.theme_variant }}
+      XZ_COMPRESS: ${{ inputs.xz_compress }}
+      CREATE_RELEASE: ${{ inputs.create_release }}
+    steps:
+      - name: Girdileri doğrula
+        run: |
+          if [ -n "$IMAGE_SIZE_MB" ] && ! [[ "$IMAGE_SIZE_MB" =~ ^[0-9]+$ ]]; then
+            echo "::error::image_size_mb yalnızca rakamlardan oluşmalıdır"; exit 1
+          fi
+
+      - name: Proje dosyalarını indir (tema ve iş akışı)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Haiku işletim sisteminin kaynak kodunu indir
+        run: |
+          git clone --depth 1 https://review.haiku-os.org/haiku haiku
+          test -x haiku/configure || { echo "::error::Haiku kaynak deposunda configure dosyası bulunamadı"; exit 1; }
+
+      - name: Bağımlılıkları yükle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git build-essential gcc-multilib g++-multilib make bison flex \
+            texinfo autoconf automake libtool gawk nasm wget unzip zip less bc \
+            zlib1g-dev libzstd-dev libssl-dev xorriso mtools python3 xz-utils
+
+      - name: Derleme araçlarını indir (çapraz derleyici ve jam)
+        run: |
+          git clone --depth 1 https://github.com/haiku/buildtools.git buildtools \
+            || git clone --depth 1 https://review.haiku-os.org/buildtools.git buildtools
+
+      - name: Haiku jam aracını derle
+        working-directory: buildtools/jam
+        run: |
+          make
+          sudo ./jam0 install
+          jam -v || true
+
+      - name: Yapılandırma (çapraz derleyicinin derlenmesi zaman alabilir)
+        working-directory: haiku
+        run: |
+          mkdir -p "generated.$ARCH"
+          cd "generated.$ARCH"
+          if [ "$ARCH" = "x86_gcc2h" ]; then
+            ../configure -j"$(nproc)" --cross-tools-source ../../buildtools \
+              --build-cross-tools x86_gcc2 --build-cross-tools x86
+          else
+            ../configure -j"$(nproc)" --cross-tools-source ../../buildtools \
+              --build-cross-tools "$ARCH"
+          fi
+
+      - name: UserBuildConfig (imaj boyutu ve Future teması)
+        working-directory: haiku
+        run: |
+          OUT="generated.$ARCH/UserBuildConfig"
+          : > "$OUT"
+
+          if [ -n "$IMAGE_SIZE_MB" ]; then
+            echo "HAIKU_IMAGE_SIZE = $IMAGE_SIZE_MB ;" >> "$OUT"
+          fi
+
+          if [ "$APPLY_THEME" = "true" ]; then
+            if [ ! -f "$GITHUB_WORKSPACE/theme/kde2haiku.py" ]; then
+              echo "::error::apply_theme acik ama proje deposunda theme/kde2haiku.py yok"; exit 1
+            fi
+            T="$GITHUB_WORKSPACE/theme"
+            BUILT="$GITHUB_WORKSPACE/theme-built"
+            mkdir -p "$BUILT"
+              python3 "$T/kde2haiku.py" "$T/$THEME_VARIANT/$THEME_VARIANT.colors" -o "$BUILT/appearance"
+            python3 "$T/kde2haiku.py" --verify "$BUILT/appearance"
+
+            cat >> "$OUT" <<EOF
+          local themeAppearance = <future>appearance ;
+          SEARCH on \$(themeAppearance) = $BUILT ;
+          AddFilesToHaikuImage home config settings system app_server : \$(themeAppearance) ;
+
+          local themeWallpaper = <future>$THEME_VARIANT.png ;
+          SEARCH on \$(themeWallpaper) = $T/wallpapers ;
+          AddFilesToHaikuImage home Pictures : \$(themeWallpaper) ;
+          EOF
+          fi
+
+          echo "---- UserBuildConfig ----"; cat "$OUT"
+
+      - name: İmajı derle
+        working-directory: haiku/generated.${{ inputs.arch }}
+        run: |
+          jam -q -j"$(nproc)" "@$TARGET"
+          echo "---- oluşturulan dosyalar ----"
+          ls -lh haiku-*.image haiku-*.iso haiku-*.vmdk 2>/dev/null || true
+
+      - name: Çıktıyı hazırla
+        id: pack
+        working-directory: haiku/generated.${{ inputs.arch }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          case "$TARGET" in
+            *-raw)     SRC=$(ls haiku-*.image | head -n1); EXT=img ;;
+            *-anyboot) SRC=$(ls haiku-*-anyboot.iso | head -n1); EXT=iso ;;
+            *-vmware)  SRC=$(ls haiku-*.vmdk | head -n1); EXT=vmdk ;;
+          esac
+          NAME="haiku-${ARCH}-${TARGET}.${EXT}"
+          cp "$SRC" "$GITHUB_WORKSPACE/dist/$NAME"
+          cd "$GITHUB_WORKSPACE/dist"
+          if [ "$XZ_COMPRESS" = "true" ] || [ "$CREATE_RELEASE" = "true" ]; then
+            xz -T0 -6 "$NAME"
+            NAME="$NAME.xz"
+          fi
+          sha256sum "$NAME" > "$NAME.sha256"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          ls -lh
+
+      - name: Derleme çıktısını yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: haiku-${{ inputs.arch }}-${{ inputs.target }}
+          path: dist/*
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      
